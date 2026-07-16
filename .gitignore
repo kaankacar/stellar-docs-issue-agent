@@ -1,0 +1,4 @@
+# GitHub App credentials (setup-github-app.sh stores keys under ~/.config, but never
+# risk a stray key landing in the repo)
+.github-app/
+*.private-key.pem

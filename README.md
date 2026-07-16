@@ -36,7 +36,12 @@ SDK section" is deliberately *not* auto-fixed — it needs a person to scope it.
 ## Assigning Copilot — the one credential you need
 
 Assigning the Copilot coding agent requires a **user token** (a PAT with `repo` / `issues:write`,
-or a GitHub App user-to-server token). The default Actions `GITHUB_TOKEN` cannot assign Copilot.
+or a GitHub App *user-to-server* token). Server-to-server installation tokens — the default
+Actions `GITHUB_TOKEN` **and** tokens minted for a GitHub App by
+`actions/create-github-app-token` — cannot assign Copilot: GitHub omits `copilot-swe-agent`
+from their `suggestedActors`, so the assignment silently no-ops (verified empirically). That is
+why this workflow keeps `ISSUE_AGENT_PAT` for this single call even when the branded app
+identity below is configured; without the PAT the hand-off is skipped cleanly.
 
 1. Create a fine-grained PAT with `Issues: read and write` (or classic `repo`).
 2. Set it as the repo secret **`ISSUE_AGENT_PAT`**.
@@ -64,12 +69,33 @@ Auto-fix fires code-generation runs, so bound it:
 - Consider running `dispatch` on a schedule/batch rather than per-issue, so a burst of issues
   (or an agent dropping a dozen at once) can't trigger a swarm of PRs.
 
+## Bot identity — one branded bot instead of github-actions[bot] (optional)
+
+By default triage comments and labels post as **github-actions[bot]**. To have this agent
+(and the companion PR review bot) act as a single branded **GitHub App** identity like
+`stellar-docs-bot[bot]`, run the included one-command setup — two browser clicks total
+(Create, then Install):
+
+```bash
+./setup-github-app.sh   # see SETUP.md
+```
+
+It registers the app via GitHub's manifest flow, captures the App ID + private key
+automatically (nothing to copy/paste), and sets them as the `APP_ID` / `APP_PRIVATE_KEY`
+repo secrets. Each job then mints a short-lived installation token with
+`actions/create-github-app-token@v3`, scoped down per job. If the secrets are absent the
+workflow falls back to `GITHUB_TOKEN` and behaves exactly as before. The one exception is
+the Copilot assignment call above, which stays on `ISSUE_AGENT_PAT` (the hand-off *comment*
+still posts as the app).
+
 ## Install
 
 1. Copy `.github/workflows/issue-agent.yml` and `.github/triage-policy.md` into your repo.
 2. Create the labels the policy uses (`P1`, `P2`, `triage:*`, `triage:autofix-candidate`).
 3. Set `CLAUDE_CODE_OAUTH_TOKEN` (or swap to an org `ANTHROPIC_API_KEY`) and `ISSUE_AGENT_PAT`.
-4. Open a small, well-scoped issue and watch it get triaged — and, if it clears the bar, turned
+4. Optional: `REPO=owner/name ./setup-github-app.sh` for the branded bot identity (see
+   [SETUP.md](SETUP.md)); skip it and the bot posts as `github-actions[bot]`.
+5. Open a small, well-scoped issue and watch it get triaged — and, if it clears the bar, turned
    into a Copilot draft PR.
 
 ## The rulebook
