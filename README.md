@@ -1,11 +1,12 @@
 # stellar-docs issue agent
 
 An AI agent that triages new issues on a docs repo and, when an issue is a small, well-scoped,
-low-risk fix, hands it to the **GitHub Copilot coding agent** to draft a PR automatically.
-Built for `stellar/stellar-docs`; repo-agnostic (reads `${{ github.repository }}`).
+low-risk fix, **drafts the fix itself and opens a PR** — no Copilot hand-off, no user-token PAT
+needed. Built for `stellar/stellar-docs`; repo-agnostic (reads `${{ github.repository }}`).
 
 Companion to the [PR review bot](https://github.com/kaankacar/stellar-docs-review-bot) — one
-handles incoming PRs, this one handles incoming issues (and turns the easy ones into PRs).
+handles incoming PRs, this one handles incoming issues (and turns the easy ones into PRs that
+the PR bot then reviews).
 
 ## How it works — one workflow, two jobs (the safety boundary)
 
@@ -14,11 +15,15 @@ handles incoming PRs, this one handles incoming issues (and turns the easy ones 
 - **`triage`** — runs the model (Claude), reads the issue, dedupes (open + closed issues, and
   open PRs that might resolve it), verifies the claim against the checkout, labels + prioritizes,
   proposes a close where policy allows, and **judges auto-fixability**. It proposes an auto-fix
-  via a label; it has no assignment power. This is the half that ingests untrusted issue text.
-- **`dispatch`** — runs **no model**, never reads the issue prose; if the issue carries
-  `triage:autofix-candidate` it assigns the **Copilot coding agent**, which opens a branch +
-  draft PR and starts working. Because it acts only on the label, untrusted issue text can't
-  trigger a code-generation run on its own.
+  via a label; it has no write power. This is the half that ingests untrusted issue text.
+- **`autofix`** — runs only for issues labeled `triage:autofix-candidate`. Our own agent
+  creates a branch, makes the minimal edit, and opens a PR (as the bot identity) for review. It
+  **never merges**. Runs fully in CI on the App (or `GITHUB_TOKEN`) — **no PAT** — because
+  opening a PR only needs `contents: write`, not a user token.
+
+The PR it opens is then picked up by the [PR review bot](https://github.com/kaankacar/stellar-docs-review-bot),
+closing the loop: **issue → drafted fix PR → review → (trivial ones) auto-merge**, all under
+one bot identity, no human in the middle for the easy cases.
 
 ## The auto-fix bar
 
@@ -31,72 +36,54 @@ handles incoming PRs, this one handles incoming issues (and turns the easy ones 
   product/design judgment, or anything security-relevant.
 
 Everything else is triaged and labeled for a human. A rewrite like "restructure the whole JS
-SDK section" is deliberately *not* auto-fixed — it needs a person to scope it.
-
-## Assigning Copilot — the one credential you need
-
-Assigning the Copilot coding agent requires a **user token** (a PAT with `repo` / `issues:write`,
-or a GitHub App *user-to-server* token). Server-to-server installation tokens — the default
-Actions `GITHUB_TOKEN` **and** tokens minted for a GitHub App by
-`actions/create-github-app-token` — cannot assign Copilot: GitHub omits `copilot-swe-agent`
-from their `suggestedActors`, so the assignment silently no-ops (verified empirically). That is
-why this workflow keeps `ISSUE_AGENT_PAT` for this single call even when the branded app
-identity below is configured; without the PAT the hand-off is skipped cleanly.
-
-1. Create a fine-grained PAT with `Issues: read and write` (or classic `repo`).
-2. Set it as the repo secret **`ISSUE_AGENT_PAT`**.
-3. Enable the Copilot coding agent on the repo (Copilot Pro+/Enterprise). The workflow checks
-   `suggestedActors` for `copilot-swe-agent` and skips cleanly if it isn't enabled.
-
-Under the hood it uses the GraphQL assignment API (Dec 2025):
-
-```graphql
-mutation($assignableId:ID!, $actorId:ID!) {
-  replaceActorsForAssignable(input:{assignableId:$assignableId, actorIds:[$actorId]}) {
-    assignable { ... on Issue { number } }
-  }
-}
-```
-with header `GraphQL-Features: issues_copilot_assignment_api_support`.
-
-## Abuse / cost guardrails (recommended for production)
-
-Auto-fix fires code-generation runs, so bound it:
-
-- Keep the strict auto-fix bar above (small + unambiguous + low-risk only).
-- Add a human gate for anything nontrivial: have `triage` propose `triage:autofix-candidate`
-  and require a maintainer's `triage:approve-autofix` before `dispatch` assigns Copilot.
-- Consider running `dispatch` on a schedule/batch rather than per-issue, so a burst of issues
-  (or an agent dropping a dozen at once) can't trigger a swarm of PRs.
+SDK section" is deliberately *not* auto-fixed — it needs a person to scope it. And every
+auto-fix lands as a PR that is reviewed before merge — the fix agent can't merge its own work.
 
 ## Bot identity — one branded bot instead of github-actions[bot] (optional)
 
-By default triage comments and labels post as **github-actions[bot]**. To have this agent
-(and the companion PR review bot) act as a single branded **GitHub App** identity like
-`stellar-docs-bot[bot]`, run the included one-command setup — two browser clicks total
-(Create, then Install):
+By default triage/fix actions post as **github-actions[bot]**. To have this agent (and the
+companion PR bot) act as a single branded **GitHub App** identity like `stellar-docs-bot[bot]`,
+run the included one-command setup — two browser clicks total (Create, then Install):
 
 ```bash
 ./setup-github-app.sh   # see SETUP.md
 ```
 
 It registers the app via GitHub's manifest flow, captures the App ID + private key
-automatically (nothing to copy/paste), and sets them as the `APP_ID` / `APP_PRIVATE_KEY`
-repo secrets. Each job then mints a short-lived installation token with
-`actions/create-github-app-token@v3`, scoped down per job. If the secrets are absent the
-workflow falls back to `GITHUB_TOKEN` and behaves exactly as before. The one exception is
-the Copilot assignment call above, which stays on `ISSUE_AGENT_PAT` (the hand-off *comment*
-still posts as the app).
+automatically (nothing to copy/paste), and sets them as the `APP_ID` / `APP_PRIVATE_KEY` repo
+secrets. Each job mints a short-lived installation token with `actions/create-github-app-token@v3`,
+scoped down per job. If the secrets are absent the workflow falls back to `GITHUB_TOKEN`.
+
+## Alternative: hand off to the Copilot coding agent
+
+Instead of fixing it ourselves, `autofix` can assign the issue to the **GitHub Copilot coding
+agent** (which opens its own draft PR). We chose self-fix as the default because it needs no
+extra credential; the Copilot path requires a **user-token PAT** (`ISSUE_AGENT_PAT` with
+`issues: write`) — the default Actions `GITHUB_TOKEN` and even GitHub App installation tokens
+are server-to-server and **cannot** assign Copilot (GitHub omits `copilot-swe-agent` from their
+`suggestedActors`; verified empirically). If you prefer that route, set `ISSUE_AGENT_PAT` and
+swap the `autofix` job for the Copilot-assignment variant (kept in git history).
+
+## Guardrails (recommended for production)
+
+Auto-fix opens PRs automatically, so bound it:
+
+- Keep the strict auto-fix bar above (small + unambiguous + low-risk only).
+- Every fix is a PR reviewed by the PR bot + humans before merge — nothing auto-fixes to main.
+- Add a human gate for anything nontrivial: have `triage` propose `triage:autofix-candidate`
+  and require a maintainer's `triage:approve-autofix` before `autofix` runs.
+- Consider running `autofix` on a schedule/batch rather than per-issue, so a burst of issues
+  (or an agent dropping a dozen at once) can't trigger a swarm of PRs.
 
 ## Install
 
 1. Copy `.github/workflows/issue-agent.yml` and `.github/triage-policy.md` into your repo.
 2. Create the labels the policy uses (`P1`, `P2`, `triage:*`, `triage:autofix-candidate`).
-3. Set `CLAUDE_CODE_OAUTH_TOKEN` (or swap to an org `ANTHROPIC_API_KEY`) and `ISSUE_AGENT_PAT`.
+3. Set `CLAUDE_CODE_OAUTH_TOKEN` (or swap to an org `ANTHROPIC_API_KEY`).
 4. Optional: `REPO=owner/name ./setup-github-app.sh` for the branded bot identity (see
    [SETUP.md](SETUP.md)); skip it and the bot posts as `github-actions[bot]`.
 5. Open a small, well-scoped issue and watch it get triaged — and, if it clears the bar, turned
-   into a Copilot draft PR.
+   into a drafted-fix PR the PR bot reviews.
 
 ## The rulebook
 
