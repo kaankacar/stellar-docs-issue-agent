@@ -16,6 +16,7 @@ on:
 permissions:
   contents: read
   issues: write
+  id-token: write   # claude-code-action exchanges the OAuth token via OIDC on normal events
 
 concurrency:
   group: issue-agent-${{ github.event.issue.number }}
